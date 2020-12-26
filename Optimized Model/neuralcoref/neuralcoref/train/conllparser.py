@@ -1,0 +1,1057 @@
+"""Conll parser"""
+
+import re
+import argparse
+import time
+import os
+import io
+import pickle
+
+import spacy
+from spacy.lang.char_classes import ALPHA, ALPHA_LOWER, ALPHA_UPPER
+from spacy.lang.char_classes import CONCAT_QUOTES, LIST_ELLIPSES, LIST_ICONS
+from spacy.util import compile_infix_regex, compile_prefix_regex, compile_suffix_regex
+from spacy.tokens import Doc
+
+import numpy as np
+
+from tqdm import tqdm
+
+from neuralcoref.train.document import (
+	Mention,
+	Document,
+	Speaker,
+	EmbeddingExtractor,
+	MISSING_WORD,
+	extract_mentions_spans,
+)
+from neuralcoref.train.utils import parallel_process
+
+PACKAGE_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+REMOVED_CHAR = ["/", "%", "*"]
+NORMALIZE_DICT = {
+	"/.": ".",
+	"/?": "?",
+	"-LRB-": "(",
+	"-RRB-": ")",
+	"-LCB-": "{",
+	"-RCB-": "}",
+	"-LSB-": "[",
+	"-RSB-": "]",
+}
+
+FEATURES_NAMES = [
+	"mentions_features",  # 0
+	"mentions_labels",  # 1
+	"mentions_pairs_length",  # 2
+	"mentions_pairs_start_index",  # 3
+	"mentions_spans",  # 4
+	"mentions_words",  # 5
+	"pairs_ant_index",  # 6
+	"pairs_features",  # 7
+	"pairs_labels",  # 8
+	"locations",  # 9
+	"conll_tokens",  # 10
+	"spacy_lookup",  # 11
+	"doc",  # 12
+	"mentions_spans_bert",  #13
+]
+
+
+###################
+### UTILITIES #####
+
+
+def clean_token(token):
+	cleaned_token = token
+	if cleaned_token in NORMALIZE_DICT:
+		cleaned_token = NORMALIZE_DICT[cleaned_token]
+	if cleaned_token not in REMOVED_CHAR:
+		for char in REMOVED_CHAR:
+			cleaned_token = cleaned_token.replace(char, "")
+	if len(cleaned_token) == 0:
+		cleaned_token = ","
+	return cleaned_token
+
+
+def mention_words_idx(embed_extractor, mention, debug=False):
+	# index of the word in the tuned embeddings no need for normalizing,
+	# it is already performed in set_mentions_features()
+	# We take them in the tuned vocabulary which is a smaller voc tailored from conll
+	words = []
+	for _, w in sorted(mention.words_embeddings_.items()):
+		if w not in embed_extractor.stat_idx:
+			words.append(MISSING_WORD)
+		else:
+			words.append(w)
+	return [embed_extractor.stat_idx[w] for w in words]
+
+
+def check_numpy_array(feature, array, n_mentions_list, compressed=True):
+	for n_mentions in n_mentions_list:
+		if feature == FEATURES_NAMES[0]:
+			assert array.shape[0] == len(n_mentions)
+			if compressed:
+				assert np.array_equiv(array[:, 3], np.array([len(n_mentions)] * len(n_mentions)))
+				assert np.max(array[:, 2]) == len(n_mentions) - 1
+				assert np.min(array[:, 2]) == 0
+		elif feature == FEATURES_NAMES[1]:
+			assert array.shape[0] == len(n_mentions)
+		elif feature == FEATURES_NAMES[2]:
+			assert array.shape[0] == len(n_mentions)
+			assert np.array_equiv(array[:, 0], np.array(list(range(len(n_mentions)))))
+		elif feature == FEATURES_NAMES[3]:
+			assert array.shape[0] == len(n_mentions)
+			assert np.array_equiv(array[:, 0], np.array([p * (p - 1) / 2 for p in range(len(n_mentions))]))
+		elif feature == FEATURES_NAMES[4]:
+			assert array.shape[0] == len(n_mentions)
+		elif feature == FEATURES_NAMES[5]:
+			assert array.shape[0] == len(n_mentions)
+		elif feature == FEATURES_NAMES[6]:
+			assert array.shape[0] == len(n_mentions) * (len(n_mentions) - 1) / 2
+			assert np.max(array) == len(n_mentions) - 2
+		elif feature == FEATURES_NAMES[7]:
+			if compressed:
+				assert array.shape[0] == len(n_mentions) * (len(n_mentions) - 1) / 2
+				assert np.max(array[:, 7]) == len(n_mentions) - 2
+				assert np.min(array[:, 7]) == 0
+		elif feature == FEATURES_NAMES[8]:
+			assert array.shape[0] == len(n_mentions) * (len(n_mentions) - 1) / 2
+		elif feature == FEATURES_NAMES[13]:
+			assert array.shape[0] == len(n_mentions)
+
+
+### PARALLEL FCT (has to be at top-level of the module to be pickled for multiprocessing) #####
+def load_file(full_name):
+	"""
+	load a *._conll file
+	Input: full_name: path to the file
+	Output: list of tuples for each conll doc in the file, where the tuple contains:
+		(utts_text ([str]): list of the utterances in the document
+		 utts_tokens ([[str]]): list of the tokens (conll words) in the document
+		 utts_corefs: list of coref objects (dicts) with the following properties:
+			coref['label']: id of the coreference cluster,
+			coref['start']: start index (index of first token in the utterance),
+			coref['end': end index (index of last token in the utterance).
+		 utts_speakers ([str]): list of the speaker associated to each utterances in the document
+		 name (str): name of the document
+		 part (str): part of the document
+		)
+	"""
+	docs = []
+
+	with io.open(full_name, "rt", encoding="utf-8", errors="strict") as f:
+
+		lines = list(f)  # .readlines()
+		utts_text = []
+		utts_tokens = []
+		utts_corefs = []
+		utts_speakers = []
+		tokens = []
+		corefs = []
+		index = 0
+		speaker = ""
+		name = ""
+		part = ""
+		removed = 0
+		fail = 0
+		lang = ""
+		
+		if full_name.endswith("-PT.txt"):
+			lang = "PT"
+		elif full_name.endswith("-ES.txt"):
+			lang = "ES"
+
+		for li, line in enumerate(lines):
+			cols = line.split()
+
+			# End of utterance
+			if len(cols) == 0:
+				if tokens:
+					corefs_aux = []
+					for c in corefs:
+						if c["end"] is not None:
+							corefs_aux.append(c)
+						else:
+							print("Co-reference without end!\n")
+
+					utts_text.append("".join(t + " " for t in tokens))
+					utts_tokens.append(tokens)
+					utts_speakers.append(speaker)
+					utts_corefs.append(corefs_aux)
+					tokens = []
+					corefs = []
+					speaker = ""
+					continue
+
+			# End of doc (PT)
+			elif len(cols) == 2:
+				if cols[0] == "#end":
+					docs.append(
+						(utts_text, utts_tokens, utts_corefs, utts_speakers, name, part, lang)
+					)
+					utts_text = []
+					utts_tokens = []
+					utts_corefs = []
+					utts_speakers = []
+				else:
+					raise ValueError("Error on end line " + line)
+
+			# End of doc (ES) or New doc (ES and PT)
+			elif len(cols) == 3:
+				if cols[0] == "#end":
+					docs.append(
+						(utts_text, utts_tokens, utts_corefs, utts_speakers, name, part, lang)
+					)
+					utts_text = []
+					utts_tokens = []
+					utts_corefs = []
+					utts_speakers = []
+ 
+				elif cols[0] == "#begin":
+					name = cols[2]
+					part = str(1)
+
+					tokens = []
+					corefs = []
+					index = 0
+				else:
+					raise ValueError("Error on begin/end line " + line)
+
+			# Inside utterance
+			elif len(cols) > 4:
+				index = cols[0]
+				
+				if not speaker:
+					speaker = name
+
+				#co-reference annotations
+				if cols[-1] != "_": 
+					coref_expr = cols[-1].split("|")
+
+					if not coref_expr:
+						raise ValueError("Coref expression empty " + line)
+
+					for tok in coref_expr:
+					
+						try:
+							match = re.match(r"^(\(?)(\d+)(\)?)$", tok)
+						except:
+							print("error getting coreferences for line " + line)
+						
+						num = match.group(2)
+						assert num is not "", (
+							"Error parsing coref " + tok + " in " + line
+						)
+
+						if match.group(1) == "(":
+							corefs.append({"label": num, "start": index, "end": None})
+
+						if match.group(3) == ")":
+							j = None
+							for i in range(len(corefs) - 1, -1, -1):
+								if (corefs[i]["label"] == num and corefs[i]["end"] is None):
+									j = i
+									break
+							
+							if j is not None:
+								corefs[j]["end"] = index
+							else:
+								print("Co-reference without beggining!")
+
+				tokens.append(clean_token(cols[1]))
+
+			else:
+				raise ValueError("Line not standard " + line)
+	return docs
+
+
+def set_feats(doc):
+	doc.set_mentions_features()
+
+def get_feats(doc, i):
+	return doc.get_feature_array(doc_id=i)
+
+def gather_feats(gathering_array, array, feat_name, pairs_ant_index, pairs_start_index):
+	if gathering_array is None:
+		gathering_array = array
+	else:
+		if feat_name == FEATURES_NAMES[6]:
+			array = [a + pairs_ant_index for a in array]
+		elif feat_name == FEATURES_NAMES[3]:
+			array = [a + pairs_start_index for a in array]
+		gathering_array += array
+	return feat_name, gathering_array
+
+def read_file(full_name):
+	doc = ""
+	with io.open(full_name, "rt", encoding="utf-8", errors="strict") as f:
+		doc = f.read()
+	return doc
+
+
+###################
+### ConllDoc #####
+
+
+class ConllDoc(Document):
+	def __init__(self, name, part, lang, *args, **kwargs):
+		self.name = name
+		self.part = part
+		self.lang = lang
+		self.feature_matrix = {}
+		self.conll_tokens = []
+		self.conll_lookup = []
+		self.gold_corefs = []
+		self.missed_gold = []
+		super(ConllDoc, self).__init__(*args, **kwargs)
+		
+	def get_lang(self):
+		return self.lang
+
+	def get_conll_spacy_lookup(self, conll_tokens, spacy_tokens):
+		"""
+		Compute a look up table between spacy tokens (from spacy tokenizer)
+		and conll pre-tokenized tokens
+		Output: list[conll_index] => list of associated spacy tokens (assume spacy tokenizer has a finer granularity)
+		"""
+		lookup = []
+		c_iter = (t for t in conll_tokens)
+		s_iter = enumerate(t for t in spacy_tokens)
+		i, s_tok = next(s_iter)
+		for c_tok in c_iter:
+			c_lookup = []
+			while i is not None and len(c_tok) and c_tok.startswith(s_tok.text):
+				c_lookup.append(i)
+				c_tok = c_tok[len(s_tok) :]
+				i, s_tok = next(s_iter, (None, None))
+			assert len(c_lookup), "Unmatched conll and spacy tokens"
+			lookup.append(c_lookup)
+		return lookup
+
+	def add_conll_utterance(self, parsed, tokens, corefs, speaker_id, use_gold_mentions, lang):
+		conll_lookup = self.get_conll_spacy_lookup(tokens, parsed)
+		self.conll_tokens.append(tokens)
+		self.conll_lookup.append(conll_lookup)
+		# Convert conll tokens coref index in spacy tokens indexes
+		identified_gold = [False] * len(corefs)
+		for coref in corefs:
+			assert (
+				coref["label"] is not None
+				and coref["start"] is not None
+				and coref["end"] is not None
+			), ("Error in coreference " + str(coref))
+
+			coref["start"] = conll_lookup[int(coref["start"])][0]
+			coref["end"] = conll_lookup[int(coref["end"])][-1]
+
+		if speaker_id not in self.speakers:
+			speaker_name = speaker_id.split("_")
+			self.speakers[speaker_id] = Speaker(speaker_id, speaker_name)
+		if use_gold_mentions:
+			for coref in corefs:
+				mention = Mention(
+					parsed[coref["start"] : coref["end"] + 1],
+					len(self.mentions),
+					len(self.utterances),
+					self.n_sents,
+					speaker=self.speakers[speaker_id],
+					gold_label=coref["label"],
+				)
+				self.mentions.append(mention)
+		else:
+			mentions_spans = extract_mentions_spans(
+				doc=parsed, blacklist=self.blacklist, lang=lang
+			)
+
+			self._process_mentions(
+				mentions_spans,
+				len(self.utterances),
+				self.n_sents,
+				self.speakers[speaker_id],
+			)
+
+			# Assign a gold label to mentions which have one
+			for i, coref in enumerate(corefs):
+				for m in self.mentions:
+					if m.utterance_index != len(self.utterances):
+						continue
+					if coref["start"] == m.start and coref["end"] == m.end - 1:
+						m.gold_label = coref["label"]
+						identified_gold[i] = True
+			for found, coref in zip(identified_gold, corefs):
+				if not found:
+					self.missed_gold.append(
+						[
+							self.name,
+							self.part,
+							str(len(self.utterances)),
+							parsed.text,
+							parsed[coref["start"] : coref["end"] + 1].text,
+						]
+					)
+		self.utterances.append(parsed)
+		self.gold_corefs.append(corefs)
+		self.utterances_speaker.append(self.speakers[speaker_id])
+		self.n_sents += len(list(parsed.sents))
+
+	def get_single_mention_features_conll(self, mention, compressed=True):
+		""" Compressed or not single mention features"""
+		if not compressed:
+			_, features = self.get_single_mention_features(mention)
+			return features[np.newaxis, :]
+		feat_l = [
+			mention.features_["01_MentionType"],
+			mention.features_["02_MentionLength"],
+			mention.index,
+			len(self.mentions),
+			mention.features_["04_IsMentionNested"],
+			self.genre_,
+		]
+		return feat_l
+
+	def get_pair_mentions_features_conll(self, m1, m2, compressed=True):
+		""" Compressed or not single mention features"""
+		if not compressed:
+			_, features = self.get_pair_mentions_features(m1, m2)
+			return features[np.newaxis, :]
+		features_, _ = self.get_pair_mentions_features(m1, m2)
+		feat_l = [
+			features_["00_SameSpeaker"],
+			features_["01_AntMatchMentionSpeaker"],
+			features_["02_MentionMatchSpeaker"],
+			features_["03_HeadsAgree"],
+			features_["04_ExactStringMatch"],
+			features_["05_RelaxedStringMatch"],
+			features_["06_SentenceDistance"],
+			features_["07_MentionDistance"],
+			features_["08_Overlapping"],
+		]
+		return feat_l
+
+	def get_feature_array(self, doc_id, feature=None, compressed=True):
+		"""
+		Prepare feature array:
+			mentions_spans: (N, S)
+			mentions_words: (N, W)
+			mentions_features: (N, Fs)
+			mentions_labels: (N, 1)
+			mentions_pairs_start_index: (N, 1) index of beggining of pair list in pair_labels
+			mentions_pairs_length: (N, 1) number of pairs (i.e. nb of antecedents) for each mention
+			pairs_features: (P, Fp)
+			pairs_labels: (P, 1)
+			pairs_ant_idx: (P, 1) => indexes of antecedents mention for each pair (mention index in doc)
+		"""
+		if not self.mentions:
+			return {}
+
+		mentions_spans = []
+		mentions_words = []
+		mentions_spans_bert = []
+		mentions_features = []
+		pairs_ant_idx = []
+		pairs_features = []
+		pairs_labels = []
+		mentions_labels = []
+		mentions_pairs_start = []
+		mentions_pairs_length = []
+		mentions_location = []
+		n_mentions = 0
+		total_pairs = 0
+		
+
+		for mention_idx, antecedents_idx in list(
+			self.get_candidate_pairs(max_distance=None, max_distance_with_match=None)
+		):
+			n_mentions += 1
+			mention = self.mentions[mention_idx]
+			mentions_spans.append(mention.spans_embeddings)
+			mentions_spans_bert.append(mention.spans_embeddings_bert)
+
+			w_idx = mention_words_idx(self.embed_extractor, mention)
+			if w_idx is None:
+				print("error in", self.name, self.part, mention.utterance_index)
+
+			mentions_words.append(w_idx)
+			mentions_features.append(self.get_single_mention_features_conll(mention, compressed))
+			mentions_location.append(
+				[
+					mention.start,
+					mention.end,
+					mention.utterance_index,
+					mention_idx,
+					doc_id,
+				]
+			)
+			ants = [self.mentions[ant_idx] for ant_idx in antecedents_idx]
+
+			no_antecedent = (
+				not any(ant.gold_label == mention.gold_label for ant in ants)
+				or mention.gold_label is None
+			)
+			if antecedents_idx:
+				pairs_ant_idx += [idx for idx in antecedents_idx]
+				pairs_features += [
+					self.get_pair_mentions_features_conll(ant, mention, compressed)
+					for ant in ants
+				]
+				ant_labels = (
+					[0 for ant in ants]
+					if no_antecedent
+					else [
+						1 if ant.gold_label == mention.gold_label else 0 for ant in ants
+					]
+				)
+				pairs_labels += ant_labels
+			mentions_labels.append(1 if no_antecedent else 0)
+			mentions_pairs_start.append(total_pairs)
+			total_pairs += len(ants)
+			mentions_pairs_length.append(len(ants))
+
+		out_dict = {
+			FEATURES_NAMES[0]: mentions_features,
+			FEATURES_NAMES[1]: mentions_labels,
+			FEATURES_NAMES[2]: mentions_pairs_length,
+			FEATURES_NAMES[3]: mentions_pairs_start,
+			FEATURES_NAMES[4]: mentions_spans,
+			FEATURES_NAMES[5]: mentions_words,
+			FEATURES_NAMES[6]: pairs_ant_idx if pairs_ant_idx else None,
+			FEATURES_NAMES[7]: pairs_features if pairs_features else None,
+			FEATURES_NAMES[8]: pairs_labels if pairs_labels else None,
+			FEATURES_NAMES[9]: [mentions_location],
+			FEATURES_NAMES[10]: [self.conll_tokens],
+			FEATURES_NAMES[11]: [self.conll_lookup],
+			FEATURES_NAMES[12]: [
+				{
+					"name": self.name,
+					"part": self.part,
+					"utterances": list(str(u) for u in self.utterances),
+					"mentions": list(str(m) for m in self.mentions),
+				}
+			],
+			FEATURES_NAMES[13]: mentions_spans_bert,
+		}
+		
+		return n_mentions, total_pairs, out_dict
+
+
+#####################
+#### Tokenizer ######
+
+
+class WhitespaceTokenizer(object):
+	def __init__(self, vocab):
+		self.vocab = vocab
+
+	def __call__(self, text):
+		words_a = text.split(' ')
+		words = []
+
+		for w in words_a:
+			if len(w) > 0:
+				words.append(w)
+
+		# All tokens 'own' a subsequent space character in this tokenizer
+		spaces = [True] * len(words)
+		return Doc(self.vocab, words=words, spaces=spaces)
+
+
+#####################
+### ConllCorpus #####
+
+
+class ConllCorpus(object):
+	def __init__(
+		self,
+		n_jobs=4,
+		embed_path=PACKAGE_DIRECTORY + "/weights/",
+		gold_mentions=False,
+		blacklist=False,
+		pt=True,
+		es=True,
+		crossl=True
+	):
+		self.n_jobs = n_jobs
+		self.features = {}
+		self.utts_text = []
+		self.utts_tokens = []
+		self.utts_corefs = []
+		self.utts_speakers = []
+		self.utts_doc_idx = []
+		self.docs_names = []
+		self.docs = []
+		self.langs = []
+		if embed_path is not None:
+			self.embed_extractor = EmbeddingExtractor(embed_path, pt, es, crossl)
+		self.trainable_embed = []
+		self.trainable_voc = []
+		self.gold_mentions = gold_mentions
+		self.blacklist = blacklist
+
+	def check_words_in_embeddings_voc(self, embedding, tuned=False):
+		print("Checking if words are in embedding voc")
+		if tuned:
+			embed_voc = embedding.tun_idx
+		else:
+			embed_voc = embedding.stat_idx
+		missing_words = []
+		missing_words_sents = []
+		missing_words_doc = []
+		for doc in self.docs:
+			for sent in doc.utterances:
+				for word in sent:
+					w = embedding.normalize_word(word)
+					if w not in embed_voc:
+						missing_words.append(w)
+						missing_words_sents.append(sent.text)
+						missing_words_doc.append(doc.name + doc.part)
+						
+		return missing_words, missing_words_sents, missing_words_doc
+
+	def test_sentences_words(self, save_file):
+		print("Saving sentence list")
+		with io.open(save_file, "w", encoding="utf-8") as f:
+			
+			for doc in self.docs:
+				out_str = "#begin document (" + doc.name + "); part " + doc.part + "\n"
+				f.write(out_str)
+				for sent in doc.utterances:
+					f.write(sent.text + "\n")
+				out_str = "#end document\n\n"
+				f.write(out_str)
+
+	def save_sentences(self, save_file):
+		print("Saving sentence list")
+		with io.open(save_file, "w", encoding="utf-8") as f:
+			
+			for doc in self.docs:
+				out_str = "#begin document (" + doc.name + "); part " + doc.part + "\n"
+				f.write(out_str)
+				for sent in doc.utterances:
+					f.write(sent.text + "\n")
+				out_str = "#end document\n\n"
+				f.write(out_str)
+
+	def build_key_file(self, data_path, key_file, pt, es):
+		print("Building key file from corpus")
+		print("Saving in", key_file)
+		# Create a pool of processes. By default, one is created for each CPU in your machine.
+		with io.open(key_file, "w", encoding="utf-8") as kf:
+
+			for dirpath, _, filenames in os.walk(data_path):
+				print("In", dirpath)
+				print(filenames)
+				file_list = []
+				if pt:
+					file_list += [
+						os.path.join(dirpath, f)
+						for f in filenames
+						if f.endswith("-PT.txt")
+					]
+				if es:
+					file_list += [
+						os.path.join(dirpath, f)
+						for f in filenames
+						if f.endswith("-ES.txt")
+					]
+				print(file_list)
+				cleaned_file_list = []
+				for f in file_list:
+					cleaned_file_list.append(f)
+
+				for file in cleaned_file_list:
+					with io.open(file, "rt", encoding="utf-8", errors="strict") as f:
+
+						lines = list(f)  # .readlines()
+						name = ""
+						ind = []
+						words = []
+						corefs = []
+						cors = []
+
+						for li, line in enumerate(lines):
+							cols = line.split()
+
+							if len(cols) == 0:
+								if words:
+									for c in corefs:
+										if c["end"] is None:
+											cors[c["start"]] = "_"
+
+									for i in range(len(ind)):
+										t = name + " 1 " + str(ind[i]) + " " + str(words[i]) + " " + str(cors[i])
+										kf.write(t + "\n")
+									kf.write("\n")
+
+									ind = []
+									words = []
+									corefs = []
+									cors = []
+									continue
+									
+							# End of doc (PT)
+							elif len(cols) == 2:
+								name = ""
+								kf.write("#end document\n")
+							
+							# New doc (ES and PT) / End of document (ES)       
+							elif len(cols) == 3:
+								if cols[0] == "#end":
+									name = ""
+									kf.write("#end document\n")
+
+								elif cols[0] == "#begin":
+									name = cols[2]
+									t = "#begin document (" + name + "); part 1"
+									kf.write(t + "\n")
+
+									corefs = []
+
+							# Inside utterance
+							elif len(cols) > 4:
+								ind.append(cols[0])
+								words.append(cols[1])
+								cors.append(cols[-1])
+
+								if cols[-1] != "_": 
+									coref_expr = cols[-1].split("|")
+
+									for tok in coref_expr:
+
+										try:
+											match = re.match(r"^(\(?)(\d+)(\)?)$", tok)
+										except:
+											print("error getting coreferences for line " + line)
+										
+										num = match.group(2)
+
+										if match.group(1) == "(":
+											corefs.append({"label": num, "start": len(cors)-1, "end": None})
+
+										if match.group(3) == ")":
+											j = None
+											for i in range(len(corefs) - 1, -1, -1):
+												if (corefs[i]["label"] == num and corefs[i]["end"] is None):
+													j = i
+													break
+											
+											if j is not None:
+												corefs[j]["end"] = len(cors)-1
+
+	def list_undetected_mentions(self, data_path, save_file):
+		self.read_corpus(data_path)
+		print("Listing undetected mentions")
+		with io.open(save_file, "w", encoding="utf-8") as out_file:
+			for doc in tqdm(self.docs):
+				for name, part, utt_i, utt, coref in doc.missed_gold:
+					out_str = name + "\t" + part + "\t" + utt_i + '\t"' + utt + '"\n'
+					out_str += coref + "\n"
+					out_file.write(out_str)
+
+	def read_corpus(self, data_path, pt=True, es=False):
+		print("Reading files")
+		for dirpath, _, filenames in os.walk(data_path):
+			print("In", dirpath, os.path.abspath(dirpath))
+			file_list = []
+			if pt:
+				file_list += [
+					os.path.join(dirpath, f)
+					for f in filenames
+					if f.endswith("-PT.txt")
+				]
+			if es:
+				file_list += [
+					os.path.join(dirpath, f)
+					for f in filenames
+					if f.endswith("-ES.txt")
+				]
+			cleaned_file_list = []
+			for f in file_list:
+				cleaned_file_list.append(f)
+			for f in filenames:
+				print(f)
+			doc_list = parallel_process(cleaned_file_list, load_file)
+			for docs in doc_list:  # executor.map(self.load_file, cleaned_file_list):
+				for (
+					utts_text,
+					utt_tokens,
+					utts_corefs,
+					utts_speakers,
+					name,
+					part,
+					lang,
+				) in docs:
+					self.utts_text += utts_text
+					self.utts_tokens += utt_tokens
+					self.utts_corefs += utts_corefs
+					self.utts_speakers += utts_speakers
+					self.utts_doc_idx += [len(self.docs_names)] * len(utts_text)
+					self.docs_names.append((name, part))
+					self.langs.append(lang)
+		print("utts_text size", len(self.utts_text))
+		print("utts_tokens size", len(self.utts_tokens))
+		print("utts_corefs size", len(self.utts_corefs))
+		print("utts_speakers size", len(self.utts_speakers))
+		print("utts_doc_idx size", len(self.utts_doc_idx))
+		print("Building docs")
+		for i in range(len(self.docs_names)):
+			name, part = self.docs_names[i]
+			language = self.langs[i]
+			self.docs.append(
+				ConllDoc(
+					name=name,
+					part=part,
+					lang=language,
+					nlp=None,
+					blacklist=self.blacklist,
+					consider_speakers=True,
+					embedding_extractor=self.embed_extractor,
+					conll=0,
+				)
+			)
+			
+		nlp = None
+		nlp_2 = None
+		
+		print("Loading spacy model")
+		if pt:
+			model = "pt_core_news_sm"
+			print("Loading model", model)
+			nlp = spacy.load(model)
+		if es:
+			model = "es_core_news_sm"
+			print("Loading model", model)
+			nlp_2 = spacy.load(model)
+			nlp_2.tokenizer = WhitespaceTokenizer(nlp_2.vocab)
+
+		print(
+			"Parsing utterances and filling docs with use_gold_mentions="
+			+ (str(bool(self.gold_mentions)))
+		)
+
+		doc_iter = (s for s in self.utts_text)
+		
+		if nlp_2 is None:
+			for utt_tuple in tqdm(
+				zip(
+					nlp.pipe(doc_iter),
+					self.utts_tokens,
+					self.utts_corefs,
+					self.utts_speakers,
+					self.utts_doc_idx,
+				)
+			):
+				spacy_tokens, conll_tokens, corefs, speaker, doc_id = utt_tuple
+				doc = spacy_tokens
+				self.docs[doc_id].add_conll_utterance(
+					doc, conll_tokens, corefs, speaker, use_gold_mentions=self.gold_mentions, lang=nlp.meta["lang"]
+				)
+		else:
+			if nlp is not None:
+				for utt_tuple in tqdm(
+					zip(
+						nlp.pipe(doc_iter),
+						self.utts_tokens,
+						self.utts_corefs,
+						self.utts_speakers,
+						self.utts_doc_idx,
+					)
+				):
+					spacy_tokens, conll_tokens, corefs, speaker, doc_id = utt_tuple
+					if self.docs[doc_id].get_lang() == "PT":
+						doc = spacy_tokens
+						self.docs[doc_id].add_conll_utterance(
+							doc, conll_tokens, corefs, speaker, use_gold_mentions=self.gold_mentions, lang=nlp.meta["lang"]
+						)
+
+			doc_iter = (s for s in self.utts_text)
+					
+			for utt_tuple in tqdm(
+				zip(
+					nlp_2.pipe(doc_iter),
+					self.utts_tokens,
+					self.utts_corefs,
+					self.utts_speakers,
+					self.utts_doc_idx,
+				)
+			):
+				spacy_tokens, conll_tokens, corefs, speaker, doc_id = utt_tuple
+				if self.docs[doc_id].get_lang() == "ES":
+					doc = spacy_tokens
+					self.docs[doc_id].add_conll_utterance(
+						doc, conll_tokens, corefs, speaker, use_gold_mentions=self.gold_mentions, lang=nlp_2.meta["lang"]
+					)
+
+	def build_and_gather_multiple_arrays(self, save_path):
+		print(f"Extracting mentions features with {self.n_jobs} job(s)")
+		parallel_process(self.docs, set_feats, n_jobs=self.n_jobs)
+
+		print(f"Building and gathering array with {self.n_jobs} job(s)")
+		arr = [{"doc": doc, "i": i} for i, doc in enumerate(self.docs)]
+		arrays_dicts = parallel_process(
+			arr, get_feats, use_kwargs=True, n_jobs=self.n_jobs
+		)
+		gathering_dict = dict((feat, None) for feat in FEATURES_NAMES)
+		n_mentions_list = []
+		pairs_ant_index = 0
+		pairs_start_index = 0
+		for npaidx in tqdm(range(len(arrays_dicts))):
+			try:
+				n, p, arrays_dict = arrays_dicts[npaidx]
+			except:
+				# empty array dict, cannot extract the dict values for this doc
+				continue
+
+			for f in FEATURES_NAMES:
+				if gathering_dict[f] is None:
+					gathering_dict[f] = arrays_dict[f]
+				else:
+					if f == FEATURES_NAMES[6]:
+						if arrays_dict[f] != None:
+							array = [a + pairs_ant_index for a in arrays_dict[f]]
+						else:
+							array = []
+							
+					elif f == FEATURES_NAMES[3]:
+						if arrays_dict[f] != None:
+							array = [a + pairs_start_index for a in arrays_dict[f]]
+						else:
+							array = []
+					else:
+						array = arrays_dict[f]
+
+					if array == None:
+						array = []
+					gathering_dict[f] += array
+			pairs_ant_index += n
+			pairs_start_index += p
+			n_mentions_list.append(n)
+
+		total_mentions = 0
+		for num in n_mentions_list:
+			total_mentions += num
+
+		print("NR MENTIONS: ", total_mentions)
+
+		for feature in FEATURES_NAMES[:9] + FEATURES_NAMES[13:]:
+			feature_data = gathering_dict[feature]
+			if not feature_data:
+				print("No data for", feature)
+				continue
+			print("Building numpy array for", feature, "length", len(feature_data))
+			if feature not in ["mentions_spans", "mentions_spans_bert"]:
+				array = np.array(feature_data)
+				if array.ndim == 1:
+					array = np.expand_dims(array, axis=1)
+			else:
+				array = np.stack(feature_data)
+			print("Saving numpy", feature, "size", array.shape)
+			np.save(save_path + feature, array)
+		for feature in FEATURES_NAMES[9:13]:
+			feature_data = gathering_dict[feature]
+			if feature_data:
+				print("Saving pickle", feature, "size", len(feature_data))
+				with open(save_path + feature + ".bin", "wb") as fp:
+					pickle.dump(feature_data, fp)
+
+	def save_vocabulary(self, save_path):
+		def _vocabulary_to_file(path, vocabulary):
+			print("Saving vocabulary")
+			with io.open(path, "w", encoding="utf-8") as f:
+				for w in tunable_voc:
+					f.write(w + "\n")
+
+		print("Building tunable vocabulary matrix from static vocabulary")
+		tunable_voc = self.embed_extractor.tun_voc
+		_vocabulary_to_file(
+			path=save_path + "words_t_vocab.txt", vocabulary=tunable_voc
+		)
+
+		static_voc = self.embed_extractor.stat_voc
+		_vocabulary_to_file(
+			path=save_path + "words_vocab.txt", vocabulary=static_voc
+		)
+
+		tuned_word_embeddings = np.vstack(
+			[self.embed_extractor.get_stat_word(w)[1] for w in tunable_voc]
+		)
+		print("Saving tunable voc, size:", tuned_word_embeddings.shape)
+		np.save(save_path + "words_t_embeddings", tuned_word_embeddings)
+
+		static_word_embeddings = np.vstack(
+			[self.embed_extractor.static_embeddings[w] for w in static_voc]
+		)
+		print("Saving static voc, size:", static_word_embeddings.shape)
+		np.save(save_path + "words_embeddings", static_word_embeddings)
+
+
+if __name__ == "__main__":
+	DIR_PATH = os.path.dirname(os.path.realpath(__file__))
+	parser = argparse.ArgumentParser(
+		description="Training the neural coreference model"
+	)
+	parser.add_argument(
+		"--function", type=str, default="all", help='Function ("all", "key", "parse", "find_undetected")'
+	)
+	parser.add_argument(
+		"--path", type=str, default=DIR_PATH + "/data/", help="Path to the dataset"
+	)
+	parser.add_argument(
+		"--key", type=str, help="Path to an optional key file for scoring"
+	)
+	parser.add_argument(
+		"--n_jobs", type=int, default=1, help="Number of parallel jobs (default 1)"
+	)
+	parser.add_argument(
+		"--gold_mentions", type=int, default=1, help="Use gold mentions (1, default) or not (0)"
+	)
+	parser.add_argument(
+		"--blacklist", type=int, default=0, help="Use blacklist (1) or not (0, default)"
+	)
+	parser.add_argument(
+		"--pt", type=int, default=1, help="Processing PT docs (1, default) or not (0)"
+	)
+	parser.add_argument(
+		"--es", type=int, default=1, help="Processing ES docs (1, default) or not (0)"
+	)
+	parser.add_argument(
+		"--crosslingual", type=int, default=1, help="Loading ES and PT crosslingual embeddings (1, default) or not (0)"
+	)
+
+	args = parser.parse_args()
+	if args.key is None:
+		args.key = args.path + "/key.txt"
+	CORPUS = ConllCorpus(
+		n_jobs=args.n_jobs, gold_mentions=args.gold_mentions, blacklist=args.blacklist, pt=args.pt, es=args.es, crossl=args.crosslingual
+	)
+
+	if args.function == "parse" or args.function == "all":
+		SAVE_DIR = args.path + "/numpy/"
+		if not os.path.exists(SAVE_DIR):
+			os.makedirs(SAVE_DIR)
+		else:
+			if os.listdir(SAVE_DIR):
+				print("There are already data in", SAVE_DIR)
+				print("Erasing")
+				for file in os.listdir(SAVE_DIR):
+					print(file)
+					os.remove(SAVE_DIR + file)
+		start_time = time.time()
+		CORPUS.read_corpus(args.path, pt=args.pt, es=args.es)
+		print("=> read_corpus time elapsed", time.time() - start_time)
+		if not CORPUS.docs:
+			print("Could not parse any valid docs")
+		else:
+			start_time2 = time.time()
+			CORPUS.build_and_gather_multiple_arrays(SAVE_DIR)
+			print("=> build_and_gather_multiple_arrays time elapsed", time.time() - start_time2)
+			start_time2 = time.time()
+			CORPUS.save_vocabulary(SAVE_DIR)
+			print("=> save_vocabulary time elapsed", time.time() - start_time2)
+			print("=> total time elapsed", time.time() - start_time)
+
+	if args.function == "key" or args.function == "all":
+		CORPUS.build_key_file(args.path, args.key, args.pt, args.es)
+
+	if args.function == "find_undetected":
+		CORPUS.list_undetected_mentions(args.path, args.path + "/undetected_mentions.txt")
