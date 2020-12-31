@@ -541,12 +541,12 @@ class EmbeddingExtractor:
 	Compute words embedding features for mentions
 	"""
 
-	def __init__(self, pretrained_model_path, pt, es, crossl):
+	def __init__(self, pretrained_model_path, pt=1, es=1, crossl=1, pca=0):
 		_, self.static_embeddings, self.stat_idx, self.stat_voc = self.load_embeddings_from_file(
-			pretrained_model_path + "words", pt, es, crossl
+			pretrained_model_path + "words", pt, es, crossl, pca
 		)
 		_, self.tuned_embeddings, self.tun_idx, self.tun_voc = self.load_embeddings_from_file(
-			pretrained_model_path + "words", pt, es, crossl
+			pretrained_model_path + "words", pt, es, crossl, pca
 		)
 		
 		self.fallback = np.zeros(self.static_embeddings["o"].shape)
@@ -554,7 +554,7 @@ class EmbeddingExtractor:
 		self.shape = self.static_embeddings["o"].shape
 
 	@staticmethod
-	def load_embeddings_from_file(name, pt, es, crossl):
+	def load_embeddings_from_file(name, pt, es, crossl, pca):
 		print("Loading embeddings from", name)
 		embeddings = {}
 		voc_to_idx = {}
@@ -591,22 +591,23 @@ class EmbeddingExtractor:
 		##### PCA Projection #####
 
 		#Compute and subtract the mean
-		'''embeddings_mean = []
-		aux_names = []
-		for key in embeddings.keys():
-			embeddings_mean.append(embeddings[key])
-			aux_names.append(key)
-		mean = np.mean(embeddings_mean, axis=0)
+		if pca:
+			embeddings_mean = []
+			aux_names = []
+			for key in embeddings.keys():
+				embeddings_mean.append(embeddings[key])
+				aux_names.append(key)
+			mean = np.mean(embeddings_mean, axis=0)
 
-		embeddings_mean_v = embeddings_mean - mean
+			embeddings_mean_v = embeddings_mean - mean
 
-		#Compute the PCA components
-		pca = PCA(n_components=3).fit(embeddings_mean_v).components_  # [D=3, emb_size]
-		# [vocab_size, emb_size] @ [emb_size, D] @ [D, emb_size] -> [vocab_size, emb_size]
-		final_embds = embeddings_mean_v - (embeddings_mean @ pca.T @ pca)
+			#Compute the PCA components
+			pca = PCA(n_components=3).fit(embeddings_mean_v).components_  # [D=3, emb_size]
+			# [vocab_size, emb_size] @ [emb_size, D] @ [D, emb_size] -> [vocab_size, emb_size]
+			final_embds = embeddings_mean_v - (embeddings_mean @ pca.T @ pca)
 
-		for i in range(len(final_embds)):
-			embeddings[aux_names[i]] = final_embds[i]'''
+			for i in range(len(final_embds)):
+				embeddings[aux_names[i]] = final_embds[i]
 
 		print(len(idx_to_voc))
 		print(len(embeddings))

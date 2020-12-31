@@ -569,7 +569,8 @@ class ConllCorpus(object):
 		blacklist=False,
 		pt=True,
 		es=True,
-		crossl=True
+		crossl=True,
+		pca=False
 	):
 		self.n_jobs = n_jobs
 		self.features = {}
@@ -582,7 +583,7 @@ class ConllCorpus(object):
 		self.docs = []
 		self.langs = []
 		if embed_path is not None:
-			self.embed_extractor = EmbeddingExtractor(embed_path, pt, es, crossl)
+			self.embed_extractor = EmbeddingExtractor(embed_path, pt, es, crossl, pca)
 		self.trainable_embed = []
 		self.trainable_voc = []
 		self.gold_mentions = gold_mentions
@@ -1017,12 +1018,15 @@ if __name__ == "__main__":
 	parser.add_argument(
 		"--crosslingual", type=int, default=1, help="Loading ES and PT crosslingual embeddings (1, default) or not (0)"
 	)
+	parser.add_argument(
+		"--pca", type=int, default=0, help="Activate PCA Projection post-processing for embeddings (1) or not (0, default)"
+	)
 
 	args = parser.parse_args()
 	if args.key is None:
 		args.key = args.path + "/key.txt"
 	CORPUS = ConllCorpus(
-		n_jobs=args.n_jobs, gold_mentions=args.gold_mentions, blacklist=args.blacklist, pt=args.pt, es=args.es, crossl=args.crosslingual
+		n_jobs=args.n_jobs, gold_mentions=args.gold_mentions, blacklist=args.blacklist, pt=args.pt, es=args.es, crossl=args.crosslingual, pca=args.pca
 	)
 
 	if args.function == "parse" or args.function == "all":
