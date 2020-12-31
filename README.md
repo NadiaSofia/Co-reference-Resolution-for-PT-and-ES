@@ -23,13 +23,14 @@ Optimizd Model:
   - The model is prepared to do mention detection. Arg --gold_mentions in conllparser.py default to 0, can be changed.
   - The model is prepared to run in a monolingua scenario. Args --pt and --es to 0 or 1 according to the language to train, --crosslingual to 0 
   
-  To prepare the data and compute the features, do:
+
+To prepare the data and compute the features, do:
     - python -m neuralcoref.train.conllparser --path ~/.../train/
     - python -m neuralcoref.train.conllparser --path ~/.../test/
     - python -m neuralcoref.train.conllparser --path ~/.../eval/
-  To train the model, do:
+To train the model, do:
     - python -m neuralcoref.train.learn --train ~/.../train/ --eval ~/.../eval/ --test ~/.../test/
-  To test the model with previous checkpoint file, do:
+To test the model with previous checkpoint file, do:
     - python -m neuralcoref.train.learn --train ~/.../train/ --eval ~/.../eval/ --test ~/.../test/ --checkpoint_file ~/.../file --test_model 1
   
   
