@@ -8,8 +8,8 @@ Base Model:
   
   - The model is prepared to do word embeddings post-processing through PCA Projection, D=3. Arg --pca in conllparser.py default to 0, can be changed.
   - The model is also prepared to read other Portuguese and Spanish corpora, namely from Data Augmentation, as long as their names end in "-PT" ou "-ES", respectively.
-  - The model is prepared to do mention detection. Arg --gold_mentions in conllparser.py default to 0, can be changed.
-  - The model is prepared to run in a monolingua scenario. Args --pt and --es to 0 or 1 according to the language to train, --crosslingual to 0 
+  - The model is prepared to do mention detection. Arg --gold_mentions in conllparser.py default to 1, can be changed.
+  - The model is prepared to run in a monolingua scenario. Args --pt and --es in conllparser.py to 0 or 1 according to the language to train, --crosslingual in conllparser.py to 0 
   
 Optimizd Model:
   - Contains an adaptation of NeuralCoref for Portuguese and Spanish.
@@ -20,8 +20,8 @@ Optimizd Model:
   - The model is prepared to do word embeddings post-processing through PCA Projection, D=3. Arg --pca in conllparser.py default to 1, can be changed.
   - The model includes an extra single mention feature, representing [mention] and [span from 5 words before to 5 words after the mention] with Multilingal Distilled mUSE contextual embeddings.
   - The model is also prepared to read other Portuguese and Spanish corpora, namely from Data Augmentation (already included in the folders), as long as their names end in "-PT" ou "-ES", respectively.
-  - The model is prepared to do mention detection. Arg --gold_mentions in conllparser.py default to 0, can be changed.
-  - The model is prepared to run in a monolingua scenario. Args --pt and --es to 0 or 1 according to the language to train, --crosslingual to 0 
+  - The model is prepared to do mention detection. Arg --gold_mentions in conllparser.py default to 1, can be changed.
+  - The model is prepared to run in a monolingua scenario. Args --pt and --es in conllparser.py to 0 or 1 according to the language to train, --crosslingual in conllparser.py to 0 
   
 Running the model:
   - To prepare the data and compute the features, do:
