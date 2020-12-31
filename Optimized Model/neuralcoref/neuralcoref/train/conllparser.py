@@ -1019,7 +1019,7 @@ if __name__ == "__main__":
 		"--crosslingual", type=int, default=1, help="Loading ES and PT crosslingual embeddings (1, default) or not (0)"
 	)
 	parser.add_argument(
-		"--pca", type=int, default=0, help="Activate PCA Projection post-processing for embeddings (1) or not (0, default)"
+		"--pca", type=int, default=1, help="Activate PCA Projection post-processing for embeddings (1, default) or not (0)"
 	)
 
 	args = parser.parse_args()
